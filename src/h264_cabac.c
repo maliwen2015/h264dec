@@ -144,11 +144,6 @@ int h264_cabac_init(H264Slice *sl, const uint8_t *buf, int size)
     }
     c->bytestream = p;
     c->range = 0x1FE;
-    if (h264_dbg()->bits)
-        fprintf(stderr, "CINIT low=%d range=%d size=%d b=%d,%d,%d,%d\n",
-                c->low, c->range, size,
-                size > 0 ? buf[0] : 0, size > 1 ? buf[1] : 0,
-                size > 2 ? buf[2] : 0, size > 3 ? buf[3] : 0);
     if ((c->range << (CABAC_BITS + 1)) < c->low)
         return -1;
     return 0;

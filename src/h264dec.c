@@ -3,16 +3,95 @@
  */
 #include "h264_internal.h"
 
+/* Slice objects carry a large per-slice cache set (34 KB); recycling them (and
+ * their RBSP buffer) keeps a one-slice-per-picture stream from doing a
+ * calloc/free of that plus three more allocations for every picture. The cap
+ * bounds what an unusual many-slice stream can retain, and an oversized RBSP is
+ * dropped on return so a single huge NAL does not pin its buffer forever. */
+#define H264_SLICE_POOL_MAX 64
+#define H264_SLICE_RBSP_KEEP (128 * 1024)
+
 static void slice_release(H264Slice *sl)
 {
+    H264Decoder *h;
+
     if (!sl)
         return;
     h264_sps_unref(&sl->sps, "slice");
     h264_pps_unref(&sl->pps, "slice");
-    free(sl->edge_emu_buffer);
-    free(sl->bipred_scratchpad);
+    h = sl->h;
+    if (h) {
+        h264_mutex_lock(&h->slice_pool_m);
+        if (h->slice_pool_count < H264_SLICE_POOL_MAX) {
+            if (sl->rbsp_alloc > H264_SLICE_RBSP_KEEP) {
+                free(sl->rbsp);
+                sl->rbsp = NULL;
+                sl->rbsp_alloc = 0;
+            }
+            sl->next_free = h->slice_free;
+            h->slice_free = sl;
+            h->slice_pool_count++;
+            h264_mutex_unlock(&h->slice_pool_m);
+            return;
+        }
+        h264_mutex_unlock(&h->slice_pool_m);
+    }
     free(sl->rbsp);
     free(sl);
+}
+
+static H264Slice *slice_get(H264Decoder *h)
+{
+    H264Slice *sl = NULL;
+
+    h264_mutex_lock(&h->slice_pool_m);
+    if (h->slice_free) {
+        sl = h->slice_free;
+        h->slice_free = sl->next_free;
+        h->slice_pool_count--;
+    }
+    h264_mutex_unlock(&h->slice_pool_m);
+    if (sl) {
+        uint8_t *rbsp = sl->rbsp;
+        const int rbsp_alloc = sl->rbsp_alloc;
+        memset(sl, 0, sizeof(*sl));
+        sl->rbsp = rbsp;
+        sl->rbsp_alloc = rbsp_alloc;
+    } else {
+        sl = (H264Slice *)calloc(1, sizeof(*sl));
+        if (!sl)
+            return NULL;
+    }
+    sl->h = h;
+    return sl;
+}
+
+static void slice_pool_free(H264Decoder *h)
+{
+    H264Slice *sl = h->slice_free;
+
+    while (sl) {
+        H264Slice *next = sl->next_free;
+        free(sl->rbsp);
+        free(sl);
+        sl = next;
+    }
+    h->slice_free = NULL;
+    h->slice_pool_count = 0;
+}
+
+/* One scratch buffer for the parameter-set and first_mb peeks; those parses
+ * happen on the decoder owner, one at a time, and never retain the bytes. */
+uint8_t *h264_nal_scratch(H264Decoder *h, int need)
+{
+    if (h->nal_buf_alloc < need) {
+        uint8_t *p = (uint8_t *)realloc(h->nal_buf, (size_t)need);
+        if (!p)
+            return NULL;
+        h->nal_buf = p;
+        h->nal_buf_alloc = need;
+    }
+    return h->nal_buf;
 }
 
 static void free_au_slices(H264Decoder *h)
@@ -74,17 +153,18 @@ int h264_run_job(H264Decoder *cl, H264Job *job)
     H264Frame *f = job->f;
     int i, ret = 0;
 
-    for (i = 0; i < job->nb_slices; i++) {
-        H264Slice *sl = job->slices[i];
-        int r = h264_decode_slice_data(cl, sl);
-        if (h264_dbg()->bits)
-            fprintf(stderr, "slice %d: bits used %d of %d, next %d, end %d,%d\n",
-                    i, sl->gb.pos, sl->gb.size_bits, sl->next_slice_idx,
-                    sl->mb_x, sl->mb_y);
-        if (r < 0) {
-            cl->error = 1;
-            ret = -1;
-            break;
+    if (job->scratch_failed) {
+        cl->error = 1;
+        ret = -1;
+    } else {
+        for (i = 0; i < job->nb_slices; i++) {
+            H264Slice *sl = job->slices[i];
+            int r = h264_decode_slice_data(cl, sl);
+            if (r < 0) {
+                cl->error = 1;
+                ret = -1;
+                break;
+            }
         }
     }
     /* the reference pictures are no longer needed once the reconstruction is
@@ -225,21 +305,24 @@ static int parse_nal_into_slice(H264Decoder *h, const uint8_t *nal, int len,
 
     if (len < 1)
         return -1;
-    rbsp = (uint8_t *)malloc(len + 16);
-    if (!rbsp)
+    sl = slice_get(h);
+    if (!sl)
         return -1;
+    if (sl->rbsp_alloc < len + 16) {
+        uint8_t *nb = (uint8_t *)realloc(sl->rbsp, (size_t)len + 16);
+        if (!nb) {
+            slice_release(sl);
+            return -1;
+        }
+        sl->rbsp = nb;
+        sl->rbsp_alloc = len + 16;
+    }
+    rbsp = sl->rbsp;
     rbsp_size = h264_unescape_rbsp(rbsp, len + 16, nal + 1, len - 1);
     if (rbsp_size < 0) {
-        free(rbsp);
+        slice_release(sl);
         return -1;
     }
-    sl = (H264Slice *)calloc(1, sizeof(H264Slice));
-    if (!sl) {
-        free(rbsp);
-        return -1;
-    }
-    sl->h = h;
-    sl->rbsp = rbsp;
     sl->rbsp_size = rbsp_size;
     h264_br_init(&sl->gb, rbsp, rbsp_size * 8);
 
@@ -267,7 +350,6 @@ void* h264_dec_open(h264_param_t* param)
     H264Decoder *h;
 
     h264_cavlc_init();
-    h264_dbg_init();
 
     h = (H264Decoder *)calloc(1, sizeof(H264Decoder));
     if (!h)
@@ -295,8 +377,10 @@ void* h264_dec_open(h264_param_t* param)
     h->cv = &h->cond;
     h264_mutex_init(&h->filter_q.m);
     h264_cond_init(&h->filter_q.claim_c);
+    h264_mutex_init(&h->slice_pool_m);
     h->fp = &h->filter_q;
     if (h264_thread_init(h, h->param.threads) < 0) {
+        h264_mutex_destroy(&h->slice_pool_m);
         h264_mutex_destroy(&h->filter_q.m);
         h264_cond_destroy(&h->filter_q.claim_c);
         h264_cond_destroy(&h->cond);
@@ -345,7 +429,7 @@ int h264_dec_send_packet(void* decoder, h264_packet_t* packet)
         ref_idc = (nal[0] >> 5) & 3;
 
         if (type == 7 || type == 8) {
-            uint8_t *rbsp = (uint8_t *)malloc(len + 16);
+            uint8_t *rbsp = h264_nal_scratch(h, len + 16);
             int n;
             if (!rbsp) {
                 ret = H264_DEC_ERROR;
@@ -355,10 +439,8 @@ int h264_dec_send_packet(void* decoder, h264_packet_t* packet)
             if (n < 0 || (type == 7 ? h264_decode_sps(h, rbsp, n * 8, type)
                                     : h264_decode_pps(h, rbsp, n * 8)) < 0) {
                 ret = H264_DEC_ERROR;
-                free(rbsp);
                 break;
             }
-            free(rbsp);
         } else if (type == 6) {
             h264_decode_sei(h, nal, len);
         } else if (type == 9) {
@@ -371,7 +453,7 @@ int h264_dec_send_packet(void* decoder, h264_packet_t* packet)
             H264Slice *sl = NULL;
             unsigned first_mb;
             H264BitReader tmp;
-            uint8_t *rbsp = (uint8_t *)malloc(len + 16);
+            uint8_t *rbsp = h264_nal_scratch(h, len + 16);
             int n;
             if (!rbsp) {
                 ret = H264_DEC_ERROR;
@@ -379,13 +461,11 @@ int h264_dec_send_packet(void* decoder, h264_packet_t* packet)
             }
             n = h264_unescape_rbsp(rbsp, len + 16, nal + 1, len - 1);
             if (n < 0) {
-                free(rbsp);
                 ret = H264_DEC_ERROR;
                 break;
             }
             h264_br_init(&tmp, rbsp, n * 8);
             first_mb = h264_br_get_ue(&tmp);
-            free(rbsp);
 
             if (first_mb == 0 && h->nb_slices) {
                 if (process_access_unit(h) < 0)
@@ -572,6 +652,9 @@ void h264_dec_close(void* decoder)
         h264_frame_unref(h, f);
     }
     h264_pool_free(h);
+    slice_pool_free(h);
+    free(h->scratch_edge);
+    free(h->scratch_bipred);
 
     h264_sps_unref(&h->active_sps, "close");
     h264_pps_unref(&h->active_pps, "close");
@@ -584,6 +667,7 @@ void h264_dec_close(void* decoder)
     free(h->mb2br_xy);
     free(h->intra4x4_pred_mode);
     free(h->nal_buf);
+    h264_mutex_destroy(&h->slice_pool_m);
     h264_mutex_destroy(&h->mutex);
     h264_cond_destroy(&h->cond);
     h264_mutex_destroy(&h->filter_q.m);

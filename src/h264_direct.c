@@ -194,10 +194,6 @@ static void pred_spatial_direct_motion(H264Decoder *h, H264Slice *sl,
         }
         ref[list] = (int)H264_MIN3((unsigned)left_ref, (unsigned)top_ref,
                                    (unsigned)refc);
-        if (h264_dbg()->dm)
-            fprintf(stderr, "SDT fn %d %d %d L%d l %d t %d c %d r %d\n",
-                    h->cur_pic->frame_num, sl->mb_x, sl->mb_y, list,
-                    left_ref, top_ref, refc, ref[list]);
         if (ref[list] >= 0) {
             const int16_t *A = sl->mv_cache[list][h264_scan8[0] - 1];
             const int16_t *B = sl->mv_cache[list][h264_scan8[0] - 8];

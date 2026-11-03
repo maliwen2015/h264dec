@@ -6,33 +6,6 @@
  */
 #include "h264_internal.h"
 
-/* local debug: edge filter call trace. Per thread, because the deferred filter
- * runs on whichever worker took the picture and `lf_trace` is written once per
- * macroblock - one shared word there is the race ThreadSanitizer reported here.
- * The sequence counter is therefore per thread too; it only numbers trace lines. */
-static H264_THREAD_LOCAL int lf_seq;
-static H264_THREAD_LOCAL int lf_trace;
-#define LF_T(tag) if (lf_trace) { int lj_, lk_; \
-                  fprintf(stderr, "LF %s %d qp %u al %d be %d bs %d,%d,%d,%d intra %d PRE", \
-                          tag, ++lf_seq, qp, alpha, beta, bS[0], bS[1], bS[2], bS[3], intra); \
-                  for (lj_ = 0; lj_ < 4; lj_++) \
-                      for (lk_ = -3; lk_ < 3; lk_++) \
-                          fprintf(stderr, " %d", pix[lk_ + lj_ * stride]); \
-                  fprintf(stderr, "\n"); }
-#define LF_PRE(tag) if (lf_trace) { int lj_, lk_; \
-                  fprintf(stderr, "PRE %s seq %d", tag, lf_seq); \
-                  for (lj_ = 0; lj_ < 4; lj_++) \
-                      for (lk_ = -3; lk_ < 3; lk_++) \
-                          fprintf(stderr, " %d", pix[lk_ + lj_ * stride]); \
-                  fprintf(stderr, "\n"); }
-#define LF_POST(tag) if (lf_trace) { int lj_, lk_; \
-                  fprintf(stderr, "POST %s\n", tag); \
-                  for (lj_ = 0; lj_ < 4; lj_++) \
-                      for (lk_ = -3; lk_ < 3; lk_++) \
-                          fprintf(stderr, " %d", pix[lk_ + lj_ * stride]); \
-                  fprintf(stderr, "\n"); }
-
-#define LF_TC(tag) if (lf_trace) fprintf(stderr, "TC %s tc %d,%d,%d,%d\n", tag, tc[0], tc[1], tc[2], tc[3])
 static const uint8_t alpha_table[52 * 3] = {
     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
@@ -598,7 +571,6 @@ static void filter_mb_edgev(uint8_t *pix, int stride, const int bS[4],
     const unsigned index_a = qp + a;
     const int alpha = alpha_table[index_a];
     const int beta = beta_table[qp + b];
-    LF_T("filter_mb_edgev");
     if (alpha == 0 || beta == 0) return;
     if (bS[0] < 4 || !intra) {
         int8_t tc[4];
@@ -606,14 +578,12 @@ static void filter_mb_edgev(uint8_t *pix, int stride, const int bS[4],
         tc[1] = (int8_t)tc0_table[index_a][bS[1]];
         tc[2] = (int8_t)tc0_table[index_a][bS[2]];
         tc[3] = (int8_t)tc0_table[index_a][bS[3]];
-            LF_TC("edge");
         if (high) h_luma_16(pix, stride, alpha, beta, tc);
         else h_luma(pix, stride, alpha, beta, tc);
     } else {
         if (high) h_luma_intra_16(pix, stride, alpha, beta);
         else h_luma_intra(pix, stride, alpha, beta);
     }
-    LF_POST("edgev");
 }
 
 static void filter_mb_edgecv(uint8_t *pix, int stride, const int bS[4],
@@ -623,7 +593,6 @@ static void filter_mb_edgecv(uint8_t *pix, int stride, const int bS[4],
     const unsigned index_a = qp + a;
     const int alpha = alpha_table[index_a];
     const int beta = beta_table[qp + b];
-    LF_T("filter_mb_edgecv");
     if (alpha == 0 || beta == 0) return;
     if (bS[0] < 4 || !intra) {
         int8_t tc[4];
@@ -631,7 +600,6 @@ static void filter_mb_edgecv(uint8_t *pix, int stride, const int bS[4],
         tc[1] = (int8_t)(tc0_table[index_a][bS[1]] + 1);
         tc[2] = (int8_t)(tc0_table[index_a][bS[2]] + 1);
         tc[3] = (int8_t)(tc0_table[index_a][bS[3]] + 1);
-            LF_TC("edge");
         if (high) {
             if (c422) h_chroma_422_16(pix, stride, alpha, beta, tc);
             else h_chroma_16(pix, stride, alpha, beta, tc);
@@ -646,7 +614,6 @@ static void filter_mb_edgecv(uint8_t *pix, int stride, const int bS[4],
             h_chroma_intra(pix, stride, alpha, beta);
         }
     }
-    LF_POST("edgecv");
 }
 
 static void filter_mb_edgeh(uint8_t *pix, int stride, const int bS[4],
@@ -655,7 +622,6 @@ static void filter_mb_edgeh(uint8_t *pix, int stride, const int bS[4],
     const unsigned index_a = qp + a;
     const int alpha = alpha_table[index_a];
     const int beta = beta_table[qp + b];
-    LF_T("filter_mb_edgeh");
     if (alpha == 0 || beta == 0) return;
     if (bS[0] < 4 || !intra) {
         int8_t tc[4];
@@ -663,14 +629,12 @@ static void filter_mb_edgeh(uint8_t *pix, int stride, const int bS[4],
         tc[1] = (int8_t)tc0_table[index_a][bS[1]];
         tc[2] = (int8_t)tc0_table[index_a][bS[2]];
         tc[3] = (int8_t)tc0_table[index_a][bS[3]];
-            LF_TC("edge");
         if (high) v_luma_16(pix, stride, alpha, beta, tc);
         else v_luma(pix, stride, alpha, beta, tc);
     } else {
         if (high) v_luma_intra_16(pix, stride, alpha, beta);
         else v_luma_intra(pix, stride, alpha, beta);
     }
-    LF_POST("edgeh");
 }
 
 static void filter_mb_edgech(uint8_t *pix, int stride, const int bS[4],
@@ -679,7 +643,6 @@ static void filter_mb_edgech(uint8_t *pix, int stride, const int bS[4],
     const unsigned index_a = qp + a;
     const int alpha = alpha_table[index_a];
     const int beta = beta_table[qp + b];
-    LF_T("filter_mb_edgech");
     if (alpha == 0 || beta == 0) return;
     if (bS[0] < 4 || !intra) {
         int8_t tc[4];
@@ -687,14 +650,12 @@ static void filter_mb_edgech(uint8_t *pix, int stride, const int bS[4],
         tc[1] = (int8_t)(tc0_table[index_a][bS[1]] + 1);
         tc[2] = (int8_t)(tc0_table[index_a][bS[2]] + 1);
         tc[3] = (int8_t)(tc0_table[index_a][bS[3]] + 1);
-            LF_TC("edge");
         if (high) v_chroma_16(pix, stride, alpha, beta, tc);
         else v_chroma(pix, stride, alpha, beta, tc);
     } else {
         if (high) v_chroma_intra_16(pix, stride, alpha, beta);
         else v_chroma_intra(pix, stride, alpha, beta);
     }
-    LF_POST("edgech");
 }
 
 static void filter_mb_mbaff_edgev(uint8_t *pix, int stride, const int bS[], int bsi,
@@ -710,7 +671,6 @@ static void filter_mb_mbaff_edgev(uint8_t *pix, int stride, const int bS[], int 
         tc[1] = (int8_t)tc0_table[index_a][bS[1 * bsi]];
         tc[2] = (int8_t)tc0_table[index_a][bS[2 * bsi]];
         tc[3] = (int8_t)tc0_table[index_a][bS[3 * bsi]];
-            LF_TC("edge");
         if (high) h_luma_mbaff_16(pix, stride, alpha, beta, tc);
         else h_luma_mbaff(pix, stride, alpha, beta, tc);
     } else {
@@ -733,7 +693,6 @@ static void filter_mb_mbaff_edgecv(uint8_t *pix, int stride, const int bS[], int
         tc[1] = (int8_t)(tc0_table[index_a][bS[1 * bsi]] + 1);
         tc[2] = (int8_t)(tc0_table[index_a][bS[2 * bsi]] + 1);
         tc[3] = (int8_t)(tc0_table[index_a][bS[3 * bsi]] + 1);
-            LF_TC("edge");
         if (high) {
             if (c422) h_chroma_mbaff_422_16(pix, stride, alpha, beta, tc);
             else h_chroma_mbaff_16(pix, stride, alpha, beta, tc);
@@ -1419,17 +1378,6 @@ void h264_filter_mb(H264Decoder *h, H264Slice *sl, H264Frame *f, int mb_x, int m
     int first_vertical_edge_done = 0;
     int a = 52 + sl->slice_alpha_c0_offset - bd_off;
     int b = 52 + sl->slice_beta_offset - bd_off;
-
-    lf_trace = h264_dbg()->lf
-        && (h264_dbg()->mbx < 0 || mb_x == h264_dbg()->mbx)
-        && (h264_dbg()->mby < 0 || mb_y == h264_dbg()->mby)
-        && (h264_dbg()->fn < 0 || f->frame_num == h264_dbg()->fn);
-    if (lf_trace) {
-        lf_seq = 0;
-        fprintf(stderr, "LFB %d %d %d mbt %08x fld %d top %d,%08x l %d,%08x,%08x\n",
-                mb_x, mb_y, f->frame_num, mb_type, sl->mb_field_decoding_flag,
-                sl->top_mb_xy, sl->top_type,
-                sl->left_mb_xy[0], sl->left_type[0], sl->left_type[1]);    }
 
     if (f->mbaff && IS_INTERLACED(mb_type ^ sl->left_type[0]) && sl->left_type[0]) {
         int bS[8];

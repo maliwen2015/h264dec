@@ -56,12 +56,35 @@ static void fill_stream_info(H264Decoder *h, const H264SPS *sps)
     }
 }
 
-void h264_slice_bind_scratch(H264Decoder *h, H264Slice *sl)
+/* the rolling two-row intra mode buffer belongs to the decoder copy that runs
+ * the pixel work, which may not be the one that initialised the slice; the MC
+ * edge and bipred scratch is owned by that same decoder copy and shared by
+ * every slice it decodes, so only a resolution change reallocates it */
+int h264_slice_bind_scratch(H264Decoder *h, H264Slice *sl)
 {
-    /* the rolling two-row intra mode buffer belongs to the decoder copy that
-     * runs the pixel work, which may not be the one that initialised the
-     * slice */
+    const H264Frame *f = h->cur_pic;
+    const int linelen = H264_ALIGN(f->linesize[0] * 2 + 64, 64);
+
     sl->intra4x4_pred_mode = h->intra4x4_pred_mode + I4_MODE_PAD;
+
+    if (linelen > h->scratch_linelen) {
+        const int edge_alloc = linelen * 21 + 64;
+        const int bipred_alloc = linelen * 16 * 6;
+        uint8_t *e = (uint8_t *)realloc(h->scratch_edge, edge_alloc);
+        uint8_t *b;
+
+        if (!e)
+            return -1;
+        h->scratch_edge = e;
+        b = (uint8_t *)realloc(h->scratch_bipred, bipred_alloc);
+        if (!b)
+            return -1;
+        h->scratch_bipred = b;
+        h->scratch_linelen = linelen;
+    }
+    sl->edge_emu_buffer = h->scratch_edge;
+    sl->bipred_scratchpad = h->scratch_bipred;
+    return 0;
 }
 
 static int alloc_mb_tables(H264Decoder *h)
@@ -70,6 +93,8 @@ static int alloc_mb_tables(H264Decoder *h)
     const int row_mb_num = 2 * h->mb_stride;
     int x, y;
 
+    /* the workers' filter snapshots point at the tables being replaced */
+    h264_filter_clone_invalidate(h);
     free(h->mb2b_xy);
     free(h->mb2br_xy);
     free(h->intra4x4_pred_mode);
@@ -440,9 +465,6 @@ int h264_decode_slice_header(H264Decoder *h, H264Slice *sl, const H264NAL *nal,
         return -1;
     }
 
-    if (h264_dbg()->bits)
-        fprintf(stderr, "[hdr] stage ref_count pos=%d type=%d list=%d rc0=%d rc1=%d\n",
-                br->pos, sl->slice_type_nos, sl->list_count, sl->ref_count[0], sl->ref_count[1]);
     if (sl->slice_type_nos != H264_SLICE_I) {
         if (parse_ref_reordering(sl, br) < 0) {
             fprintf(stderr, "[hdr] ref_reorder fail type=%d\n", sl->slice_type_nos);
@@ -459,8 +481,6 @@ int h264_decode_slice_header(H264Decoder *h, H264Slice *sl, const H264NAL *nal,
         }
     }
 
-    if (h264_dbg()->bits)
-        fprintf(stderr, "[hdr] stage reorder pos=%d\n", br->pos);
     sl->explicit_ref_marking = 0;
     sl->nb_mmco = 0;
     if (nal_ref_idc) {
@@ -476,18 +496,12 @@ int h264_decode_slice_header(H264Decoder *h, H264Slice *sl, const H264NAL *nal,
             return -1;
     }
 
-    if (h264_dbg()->bits)
-        fprintf(stderr, "[hdr] stage marking pos=%d nb_mmco=%d\n", br->pos, sl->nb_mmco);
     sl->last_qscale_diff = 0;
     {
         int dqp;
-        if (h264_dbg()->bits)
-            fprintf(stderr, "[hdr] preqp pos=%d init=%d\n", br->pos, pps->init_qp);
         dqp = h264_br_get_se(br);
         int qp = pps->init_qp + dqp;
         const int max_qp = 51 + 6 * (sl->sps->bit_depth_luma - 8);
-        if (h264_dbg()->bits)
-            fprintf(stderr, "[hdr] postqp pos=%d dqp=%d qp=%d\n", br->pos, dqp, qp);
         if (qp < 0 || qp > max_qp) {
             fprintf(stderr, "[hdr] qp out of range %d (init_qp %d, type %d)\n",
                     qp, pps->init_qp, sl->slice_type_nos);
@@ -514,13 +528,9 @@ int h264_decode_slice_header(H264Decoder *h, H264Slice *sl, const H264NAL *nal,
         sl->deblocking_filter = (int)idc;
         if (idc < 2)
             sl->deblocking_filter ^= 1; /* 0->1 enabled, 1->0 disabled */
-        if (h264_dbg()->bits)
-            fprintf(stderr, "[hdr] deblock idc=%u pos=%d\n", idc, br->pos);
         if (sl->deblocking_filter) {
             int a = h264_br_get_se(br);
             int b = h264_br_get_se(br);
-            if (h264_dbg()->bits)
-                fprintf(stderr, "[hdr] deblock a=%d b=%d pos=%d\n", a, b, br->pos);
             if (a < -6 || a > 6 || b < -6 || b > 6) {
                 fprintf(stderr, "[hdr] deblock offsets out of range\n");
                 return -1;
@@ -532,13 +542,6 @@ int h264_decode_slice_header(H264Decoder *h, H264Slice *sl, const H264NAL *nal,
 
     sl->nal_ref_idc = nal_ref_idc;
     sl->nal_type = nal_type;
-
-    if (h264_dbg()->bits)
-        fprintf(stderr, "HDR fn %d nr %d st %d type %d bit %d qp %d deb %d a%d b%d mmco %d ps %d\n",
-                sl->frame_num, nal_ref_idc, sl->slice_type, nal_type,
-                br->pos, sl->qscale, sl->deblocking_filter,
-                sl->slice_alpha_c0_offset, sl->slice_beta_offset, sl->nb_mmco,
-                sl->picture_structure);
 
     if (br->error) {
         fprintf(stderr, "[hdr] bitreader error pos=%d size=%d type=%d\n",
@@ -675,7 +678,8 @@ int h264_slice_init(H264Decoder *h, H264Slice *sl)
     sl->resync_mb_x = sl->mb_x;
     sl->resync_mb_y = sl->mb_y;
     sl->mb_xy = sl->mb_x + sl->mb_y * h->mb_stride;
-    h264_slice_bind_scratch(h, sl);
+    if (h264_slice_bind_scratch(h, sl) < 0)
+        return -1;
 
     /* wrapped top-right slots of the 8x8 MV grid: never filled per MB, so
      * they must read as not available (as in the reference) */
@@ -713,17 +717,6 @@ int h264_slice_init(H264Decoder *h, H264Slice *sl)
     sl->mb_skip_run = -1;
     sl->prev_mb_skipped = 0;
     sl->next_mb_skipped = 0;
-
-    /* allocate slice scratch buffers */
-    if (!sl->edge_emu_buffer) {
-        int linelen = H264_ALIGN(f->linesize[0] * 2 + 64, 64);
-        sl->edge_emu_alloc = linelen * 21 + 64;
-        sl->edge_emu_buffer = (uint8_t *)malloc(sl->edge_emu_alloc);
-        sl->bipred_alloc = linelen * 16 * 6;
-        sl->bipred_scratchpad = (uint8_t *)malloc(sl->bipred_alloc);
-        if (!sl->edge_emu_buffer || !sl->bipred_scratchpad)
-            return -1;
-    }
 
     (void)i;
     (void)sps;
@@ -795,10 +788,6 @@ int h264_decode_slice_data(H264Decoder *h, H264Slice *sl)
 
         if (ret < 0 || (f->cabac &&
                         sl->cabac.bytestream > sl->cabac.bytestream_end + 4)) {
-            if (h264_dbg()->bits)
-                fprintf(stderr, "[dec] mb %d %d ret=%d cabac=%d over=%ld\n",
-                        sl->mb_x, sl->mb_y, ret, f->cabac,
-                        (long)(sl->cabac.bytestream - sl->cabac.bytestream_end));
             return -1;
         }
 

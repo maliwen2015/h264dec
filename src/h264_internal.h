@@ -148,28 +148,6 @@ H264_INLINE void h264_zero(void *p, int n)
 #define AV_ZERO64(p)        h264_zero((p), 8)
 #define AV_ZERO128(p)       h264_zero((p), 16)
 
-/* Environment-gated debug tracing.  The environment is read once, at open, into a
- * plain global: these gates are tested per macroblock, so the accessor has to be a
- * load and a test rather than a call - out of line it measured 1.0% of a one-slot
- * decode. h264_dbg_init() is idempotent and atomic, so two decoders opened at once
- * both see the values filled, with the same ones. */
-typedef struct H264Dbg {
-    int mv, mc, pred, dm, mb, lf, bits;   /* trace enables */
-    int coef;                             /* dump dequantized coefficients too */
-    int ps;                               /* trace parameter set references */
-    int mbx, mby;                         /* traced macroblock position */
-    int fn;                               /* traced frame_num, -1 matches all */
-    int lag;                              /* stall progress reports this many
-                                             "us" to widen any wait window */
-} H264Dbg;
-
-extern H264Dbg h264_dbg_cfg;
-void h264_dbg_init(void);
-H264_INLINE const H264Dbg *h264_dbg(void) { return &h264_dbg_cfg; }
-/* true when the trace for flag `f` is on and `sl` is the traced position */
-#define H264_DBG_HIT(f, sl) (h264_dbg()->f && h264_dbg()->mbx == (sl)->mb_x && \
-                             h264_dbg()->mby == (sl)->mb_y)
-
 H264_INLINE int h264_mid_pred(int a, int b, int c)
 {
     if (a > b) {
@@ -877,9 +855,10 @@ typedef struct H264Slice {
 
     uint8_t *edge_emu_buffer;
     uint8_t *bipred_scratchpad;
-    int edge_emu_alloc, bipred_alloc;
     uint8_t *rbsp;
     int rbsp_size;
+    int rbsp_alloc;
+    struct H264Slice *next_free;    /* decoder slice pool */
     int mb_linesize, mb_uvlinesize;
     int pixel_shift;              /* 1 for 10-bit, 0 for 8-bit */
 
@@ -956,6 +935,7 @@ typedef struct H264Job {
     int64_t seq;
     int state;
     int result;
+    int scratch_failed;    /* worker scratch could not be grown */
 } H264Job;
 
 /* Rows the loop filter can take. A picture goes on the list when its decode pass
@@ -1026,6 +1006,16 @@ struct H264Decoder {
     int current_slice;
     int cur_first_mb;
 
+    /* Reusable allocations: the MC edge and bipred scratch is owned by each
+     * decoder/worker and grown only when the resolution grows, and decoded
+     * slice objects (with their RBSP buffer) are recycled through a free list
+     * instead of being calloc'd and freed per NAL. */
+    uint8_t *scratch_edge, *scratch_bipred;
+    int scratch_linelen;
+    H264Slice *slice_free;
+    int slice_pool_count;
+    h264_mutex slice_pool_m;
+
     /* frame-level threading: one worker per job slot, each with its own
      * decoder copy for the pixel work */
     h264_mutex *mtx;         /* points at mutex below, shared with the clones */
@@ -1035,7 +1025,8 @@ struct H264Decoder {
     int threaded;
     int64_t commit_next;
     int64_t job_seq;
-
+    int filter_waiters;      /* a table freeze is waiting for a running pass */
+    int filter_frozen;       /* idle workers must not start a filter pass */
     int mb_width, mb_height, mb_stride, b_stride;
     int width, height;         /* coded */
     int disp_width, disp_height;
@@ -1127,6 +1118,7 @@ int h264_split_annexb(const uint8_t *data, int size, int *pos,
                       const uint8_t **nal, int *nal_len);
 int h264_split_avcc(const uint8_t *data, int size, int *pos,
                     const uint8_t **nal, int *nal_len, int len_size);
+uint8_t *h264_nal_scratch(H264Decoder *h, int need);
 int h264_unescape_rbsp(uint8_t *dst, int dst_size, const uint8_t *src, int src_len);
 void h264_decode_sei(H264Decoder *h, const uint8_t *nal, int len);
 void h264_sei_reset(H264Decoder *h);
@@ -1460,7 +1452,7 @@ void h264_loop_filter_chroma_intra_neon(uint8_t *pix, int xstride, int ystride,
 #endif
 
 /* frame-level threading */
-void h264_slice_bind_scratch(H264Decoder *h, H264Slice *sl);
+int h264_slice_bind_scratch(H264Decoder *h, H264Slice *sl);
 int h264_thread_init(H264Decoder *h, int threads);
 void h264_thread_close(H264Decoder *h);
 void h264_decoder_lock(H264Decoder *h);
@@ -1470,6 +1462,7 @@ H264Job *h264_job_acquire(H264Decoder *h);
 void h264_job_submit(H264Decoder *h, H264Job *job);
 void h264_job_wait_last(H264Decoder *h);
 void h264_job_wait_all(H264Decoder *h);
+void h264_filter_clone_invalidate(H264Decoder *h);
 void h264_progress_report(H264Decoder *h, H264Frame *f, int line, int dir);
 void h264_progress_await(H264Decoder *h, const H264Frame *f, int line, int dir);
 /* the decode pass says how far it has got, and anyone blocked takes the filter
@@ -1481,5 +1474,4 @@ void h264_filter_wait_done(H264Decoder *h, H264Frame *f);
 int h264_run_job(H264Decoder *cl, H264Job *job);
 /* bookkeeping that has to happen in decode order, run by the decoder owner */
 void h264_commit_job(H264Decoder *h, H264Job *job);
-void h264_slice_bind_scratch(H264Decoder *h, H264Slice *sl);
 #endif /* H264_INTERNAL_H */

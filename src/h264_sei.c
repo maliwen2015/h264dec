@@ -165,14 +165,12 @@ void h264_decode_sei(H264Decoder *h, const uint8_t *nal, int len)
 
     if (len < 2)
         return;
-    rbsp = (uint8_t *)malloc(len + 16);
+    rbsp = h264_nal_scratch(h, len + 16);
     if (!rbsp)
         return;
     size = h264_unescape_rbsp(rbsp, len + 16, nal + 1, len - 1);
-    if (size <= 0) {
-        free(rbsp);
+    if (size <= 0)
         return;
-    }
     h264_br_init(&br, rbsp, size * 8);
 
     while (!br.error && h264_br_bits_left(&br) > 8) {
@@ -218,5 +216,5 @@ void h264_decode_sei(H264Decoder *h, const uint8_t *nal, int len)
         }
     }
 done:
-    free(rbsp);
+    ;
 }

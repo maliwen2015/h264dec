@@ -679,11 +679,8 @@ that took 32.9 Gcyc of summed worker wall take 20.7. Back to back against the
 previous build that is 1.246x at six slots and 1.233x at 1080p (medians of seven
 paired runs), 1.086x at four, 1.060x at two, and nothing at one slot, where the
 early return means the path is not used at all. Output is unchanged: 27 of 27
-bit-exact against the reference at one slot, 27 of 27 bit-exact again at ten, and
-27 of 27 still bit-exact at twelve with `H264_DEBUG_LAG=2` stalling every report
-- that knob delays a report between the pixel writes and the publication, so a
-wait bound that lets a consumer read a row that is not finished comes out as a
-wrong picture rather than as a rare timing hit.
+bit-exact against the reference at one slot, 27 of 27 bit-exact again at ten,
+and 27 of 27 still bit-exact at twelve.
 
 Eight slots used to be slower than six, and that was a lock rather than the
 picture pool - it took a second look to find which one. A row-progress report and
@@ -767,8 +764,38 @@ A/B against the pre-fix build says the ordering costs nothing: 0.985, 1.028 and 
 one slot and 0.992, 0.978 and 0.991 at twelve, against a control band of 0.977 to 1.014.
 The report stays compiled in, and `tests/fuzz.sh` already fails a run that prints it.
 ThreadSanitizer's list for a threaded run goes from eight races to seven, which is what
-says the class is closed rather than the symptom silenced; what is left is recorded in
-Known issues below.
+says the class is closed rather than the symptom silenced.
+
+The seventh was the filter help reading the worker's decode clone at the same time as
+`h264_job_submit()` bound the next job into it: six write/read pairs, all on the
+`mb_width`/`mb_height`/`mb_stride`/`b_stride` geometry. The fix is a second decoder copy
+per worker rather than a lock on the filter path. `filter_clone` is a snapshot of the
+geometry, the read-only block-offset tables and the parameter block of the last committed
+job, and only the filter help reads it, so binding the next job never touches the state a
+running pass uses. The tables behind that snapshot are the one thing a dimension or
+pixel-format change replaces, so `alloc_mb_tables()` freezes the helpers, waits for the
+passes already in flight, invalidates every snapshot and only then frees the old tables.
+Freezing is what makes the drain cheap: an idle worker that is left free to try an empty
+filter pass wakes the pool each time, and a drain without the freeze was measured
+spending 657 ms of a 1.0 s 720p decode in wakeups. With it, twelve slots measure 1.00x
+against the pre-snapshot pooled build on 720p and 1.015x on 1080p, and ThreadSanitizer
+reports no warnings on the corpus at 2, 6 and 12 slots (with `setarch $(uname -m) -R`;
+without it this WSL build dies with `unexpected memory mapping`). The four reports that
+remained after the snapshot were the CAVLC trace coordinates: two workers lazily cached
+`H264_TRACE_X`/`H264_TRACE_Y` in plain statics on their first picture. That trace has
+since been removed from the tree altogether.
+
+A picture's allocations were the other half of the churn. Each `H264Slice` is 34 KiB, and
+the old path gave every slice its own RBSP copy and its own MC edge and bipred scratch -
+about 315 KiB at 720p and 460 KiB at 1080p - so a one-slice-per-picture stream did four
+allocations and four frees per picture: 6,000 of each for the 1,500-frame 720p clip.
+Slice objects now come from a per-decoder free list capped at 64, with the RBSP retained
+up to 128 KiB and an oversized one dropped on return; the MC scratch belongs to each
+decoder and worker copy and grows only when the resolution does; and the parameter-set,
+first-mb and SEI RBSP peeks share one grow-only buffer on the decoder. The frame pool was
+already a lazy 36-entry pool that reallocates only when the geometry or pixel format
+changes. Threads are created once in `h264_dec_open()` and joined in `h264_dec_close()`;
+no picture or slice creates a thread.
 
 That deferred pass is also where most of the remaining distance to the reference sits,
 and finding that out changed what got optimised next. Comparing one thread against one
@@ -1288,23 +1315,8 @@ Known issues
   truncated ones, always reading `refcount` in `h264_sps_unref`/
   `h264_pps_unref`. The counts are atomic now, and the active pair holds its own
   reference instead of borrowing the table's, which is what FFmpeg's
-  `AVBufferRef` counts and `ps->sps`/`ps->pps` give it. `H264_TRACE_PS=1` dumps
-  every acquire and release with its holder, reports a count that goes negative,
-  and reports a set freed while a live PPS still links to it.
-* One race is recorded rather than fixed. ThreadSanitizer on any threaded run - it needs
-  address randomisation off here, `setarch $(uname -m) -R`, or it dies with
-  `FATAL: unexpected memory mapping` - reports the owner's `bind_clone()` writes to a
-  worker's clone geometry against that worker's unlocked read in `geometry_matches()`, six
-  sites and one shape. It is benign while the invariant it leans on holds: a dimension
-  change drains every job before the geometry moves, so an idle worker that is filtering is
-  filtering a picture whose geometry cannot change underneath it. It is on the list because
-  "cannot change underneath it" is a statement about the schedule rather than about the
-  memory model, and the cheapest way to make the two agree - taking the decoder mutex
-  around the geometry read - puts a lock on the path every idle worker uses. Worth
-  revisiting if a threading bug ever smells like geometry. The two shapes that used to sit
-  beside it are gone: the owner's picture-recycle writes against the filter helper's claim
-  (fixed, and the guard in `h264_alloc_frame()` is what says so) and the file-scope
-  `lf_trace` gate, which turned out to be a throughput bug wearing a race's clothes.
+  `AVBufferRef` counts and `ps->sps`/`ps->pps` give it. A count that drops below
+  zero is reported.
 
 * Damaged pictures are reported, not hidden: `b_decode_error` is set and macroblocks
   that never decoded are painted mid gray, so `au_errors` from

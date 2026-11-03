@@ -308,46 +308,6 @@ static uint8_t transpose8(uint8_t x)
     return (uint8_t)((x >> 3) | ((x & 7) << 3));
 }
 
-H264Dbg h264_dbg_cfg;
-
-void h264_dbg_init(void)
-{
-    static int loaded;
-    int expected = 0;
-    const char *s;
-
-    /* one compare-exchange per open, and the environment block runs once per
-     * process: the winner fills the struct with the flag at -1, and everyone
-     * else waits for the release store that publishes the finished block */
-    if (__atomic_load_n(&loaded, __ATOMIC_ACQUIRE))
-        return;
-    if (!__atomic_compare_exchange_n(&loaded, &expected, -1, 0, __ATOMIC_ACQ_REL,
-                                     __ATOMIC_ACQUIRE)) {
-        while (__atomic_load_n(&loaded, __ATOMIC_ACQUIRE) != 1)
-            ;
-        return;
-    }
-
-    h264_dbg_cfg.mv   = getenv("H264_TRACE_MV") != NULL;
-    h264_dbg_cfg.mc   = getenv("H264_TRACE_MC") != NULL;
-    h264_dbg_cfg.pred = getenv("H264_TRACE_PRED") != NULL;
-    h264_dbg_cfg.dm   = getenv("H264_TRACE_DM") != NULL;
-    h264_dbg_cfg.mb   = getenv("H264_DEBUG_MB") != NULL;
-    h264_dbg_cfg.lf   = getenv("H264_TRACE_LF") != NULL;
-    h264_dbg_cfg.bits = getenv("H264_DEBUG_BITS") != NULL;
-    h264_dbg_cfg.coef = getenv("H264_TRACE_COEF") != NULL;
-    h264_dbg_cfg.ps   = getenv("H264_TRACE_PS") != NULL;
-    s = getenv("H264_TRACE_MBX");
-    h264_dbg_cfg.mbx = s ? atoi(s) : 0;
-    s = getenv("H264_TRACE_MBY");
-    h264_dbg_cfg.mby = s ? atoi(s) : 0;
-    s = getenv("H264_TRACE_FN");
-    h264_dbg_cfg.fn = s ? atoi(s) : -1;
-    s = getenv("H264_DEBUG_LAG");
-    h264_dbg_cfg.lag = s ? atoi(s) : 0;
-    __atomic_store_n(&loaded, 1, __ATOMIC_RELEASE);
-}
-
 void h264_init_scan_tables(H264Decoder *h)
 {
     int i;

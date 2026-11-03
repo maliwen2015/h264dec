@@ -56,43 +56,6 @@ static const int pixel_aspect[17][2] = {
     { 64, 33 }, { 160, 99 }, { 4, 3 }, { 3, 2 }, { 2, 1 },
 };
 
-/* live PPS objects, so an SPS release can say whether a PPS still
- * links to it (that is the deficit this trace exists to find) */
-static const void *live_pps[64];
-static int n_live_pps;
-
-static void live_pps_note(const void *p, int born)
-{
-    int i;
-    if (!h264_dbg()->ps)
-        return;
-    if (born) {
-        for (i = 0; i < n_live_pps; i++)
-            if (live_pps[i] == p)
-                return;
-        if (n_live_pps < 64)
-            live_pps[n_live_pps++] = p;
-    } else {
-        for (i = 0; i < n_live_pps; i++)
-            if (live_pps[i] == p) {
-                live_pps[i] = live_pps[--n_live_pps];
-                break;
-            }
-    }
-}
-
-/* Parameter set lifetime trace (H264_TRACE_PS=1). The holders of a parameter
- * set are its table slot, the active pair, the PPS decoded against an SPS and
- * every slice header parsed with it; a count that drops below zero means one of
- * those was not accounted for. */
-static void ps_trace(const char *op, const void *obj, int id, int refcount,
-                     const char *why)
-{
-    if (h264_dbg()->ps)
-        fprintf(stderr, "PS %-10s obj=%p id=%-3d ref=%-3d by %s\n",
-                op, obj, id, refcount, why);
-}
-
 /* The counts are atomic because the decoder owner takes a reference while it
  * parses a slice header - outside the pool lock, because header parsing is not
  * allowed to wait behind a reconstruction - at the same time as a worker drops
@@ -102,8 +65,7 @@ static void ps_trace(const char *op, const void *obj, int id, int refcount,
 H264SPS *h264_sps_ref(H264SPS *sps, const char *why)
 {
     if (sps)
-        ps_trace("sps_ref", sps, sps->sps_id,
-                 __atomic_add_fetch(&sps->refcount, 1, __ATOMIC_RELAXED), why);
+        __atomic_add_fetch(&sps->refcount, 1, __ATOMIC_RELAXED);
     return sps;
 }
 
@@ -116,29 +78,20 @@ void h264_sps_unref(H264SPS **psps, const char *why)
         return;
     n = __atomic_sub_fetch(&sps->refcount, 1, __ATOMIC_ACQ_REL);
     if (n < 0) {
-        ps_trace("SPS UNDER", sps, sps->sps_id, n, why);
+        fprintf(stderr, "[h264dec] SPS refcount underflow (id %d, by %s)\n",
+                sps->sps_id, why);
         *psps = NULL;
         return;
     }
-    if (n == 0) {
-        int i;
-        ps_trace("sps_free", sps, sps->sps_id, 0, why);
-        for (i = 0; i < n_live_pps; i++)
-            if (((const H264PPS *)live_pps[i])->sps == sps)
-                fprintf(stderr,
-                        "PS SPS %p FREED while live PPS %p still links (by %s)\n",
-                        (const void *)sps, live_pps[i], why);
+    if (n == 0)
         free(sps);
-    } else
-        ps_trace("sps_unref", sps, sps->sps_id, n, why);
     *psps = NULL;
 }
 
 H264PPS *h264_pps_ref(H264PPS *pps, const char *why)
 {
     if (pps)
-        ps_trace("pps_ref", pps, pps->pps_id,
-                 __atomic_add_fetch(&pps->refcount, 1, __ATOMIC_RELAXED), why);
+        __atomic_add_fetch(&pps->refcount, 1, __ATOMIC_RELAXED);
     return pps;
 }
 
@@ -151,17 +104,15 @@ void h264_pps_unref(H264PPS **ppps, const char *why)
         return;
     n = __atomic_sub_fetch(&pps->refcount, 1, __ATOMIC_ACQ_REL);
     if (n < 0) {
-        ps_trace("PPS UNDER", pps, pps->pps_id, n, why);
+        fprintf(stderr, "[h264dec] PPS refcount underflow (id %d, by %s)\n",
+                pps->pps_id, why);
         *ppps = NULL;
         return;
     }
     if (n == 0) {
-        ps_trace("pps_free", pps, pps->pps_id, 0, why);
-        live_pps_note(pps, 0);
         h264_sps_unref(&pps->sps, "pps link");
         free(pps);
-    } else
-        ps_trace("pps_unref", pps, pps->pps_id, n, why);
+    }
     *ppps = NULL;
 }
 
@@ -610,7 +561,6 @@ int h264_decode_pps(H264Decoder *h, const uint8_t *rbsp, int size_bits)
     if (!pps)
         return -1;
     pps->refcount = 1;
-    live_pps_note(pps, 1);
     pps->pps_id = pps_id;
     pps->sps_id = sps_id;
     pps->sps = h264_sps_ref(h->sps_list[sps_id], "pps link");

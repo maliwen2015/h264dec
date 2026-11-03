@@ -379,29 +379,6 @@ static int pred_non_zero_count(H264Slice *sl, int n)
 /* ------------------------------------------------------------------ */
 /* residual                                                            */
 /* ------------------------------------------------------------------ */
-static int trace_mb_y = -2;
-
-static int cavlc_trace(void)
-{
-    if (trace_mb_y == -2) {
-        const char *s = getenv("H264_TRACE_Y");
-        trace_mb_y = s ? atoi(s) : -1;
-    }
-    return trace_mb_y;
-}
-
-static int i4_trace(H264Slice *sl)
-{
-    static int tx = -2, ty = -2;
-    if (tx == -2) {
-        const char *s = getenv("H264_TRACE_X");
-        tx = s ? atoi(s) : 0;
-        s = getenv("H264_TRACE_Y");
-        ty = s ? atoi(s) : -1;
-    }
-    return ty >= 0 && sl->mb_x == tx && sl->mb_y == ty;
-}
-
 /* a damaged level can be large enough that level * qmul overflows int; the
  * dequantisation is exact in 64 bits and the stored result is truncated to
  * the block's sample type either way */
@@ -424,31 +401,7 @@ static int decode_residual(H264Decoder *h, H264Slice *sl, int16_t *block, int n,
         else \
             block[j_] = (int16_t)(v_); \
     } while (0)
-    /* debug tracing */
-    static int trace_mb_x = -2;
-    int tr_in = 0;
-    int tr_mid = -1, tr_zl = -1, tr_on = -1, tr = 0;
     H264BitReader *br = &sl->gb;
-
-    if (trace_mb_x == -2) {
-        const char *s = getenv("H264_TRACE_X");
-        trace_mb_x = s ? atoi(s) : 0;
-    }
-    if (cavlc_trace() >= 0 && sl->mb_y == cavlc_trace() && sl->mb_x == trace_mb_x) {
-        tr = 1;
-        tr_in = br->pos;
-    }
-
-#define TR_PRINT(extra)                                                      \
-    do {                                                                     \
-        int ti_;                                                             \
-        fprintf(stderr, "RES x%d y%d n%d max%d in%d ct%d tc%d to%d mid%d zl%d out%d", \
-                sl->mb_x, sl->mb_y, n, max_coeff, tr_in, coeff_token, total_coeff, \
-                tr_on, tr_mid, tr_zl, br->pos);                              \
-        for (ti_ = 0; ti_ < total_coeff && ti_ < 16; ti_++)                 \
-            fprintf(stderr, " %d", level[ti_]);                              \
-        fprintf(stderr, "%s\n", extra);                                      \
-    } while (0)
 
     if (max_coeff <= 8) {
         if (max_coeff == 4)
@@ -470,8 +423,6 @@ static int decode_residual(H264Decoder *h, H264Slice *sl, int16_t *block, int n,
     sl->non_zero_count_cache[h264_scan8[n]] = (uint8_t)total_coeff;
 
     if (total_coeff == 0) {
-        if (tr)
-            TR_PRINT("early");
         return 0;
     }
     if (total_coeff > max_coeff) {
@@ -481,7 +432,6 @@ static int decode_residual(H264Decoder *h, H264Slice *sl, int16_t *block, int n,
     }
 
     trailing_ones = coeff_token & 3;
-    tr_on = trailing_ones;
     i = (int)peek_bits(br, 3);
     h264_br_skip(br, trailing_ones);
     level[0] = 1 - ((i & 4) >> 1);
@@ -532,8 +482,6 @@ static int decode_residual(H264Decoder *h, H264Slice *sl, int16_t *block, int n,
             level[trailing_ones] = level_code;
         }
 
-        if (tr)
-            tr_mid = br->pos;
         for (i = trailing_ones + 1; i < total_coeff; i++) {
             static const unsigned suffix_limit[7] = { 0, 3, 6, 12, 24, 48, 0x7fffffff };
             int bitsi = (int)peek_bits(br, LEVEL_TAB_BITS);
@@ -584,8 +532,6 @@ static int decode_residual(H264Decoder *h, H264Slice *sl, int16_t *block, int n,
             return -1;
     }
 
-    tr_zl = zeros_left;
-
     scantable += zeros_left + total_coeff - 1;
     if (n >= 48) {
         PUT_COEF(*scantable, level[0]);
@@ -622,9 +568,6 @@ static int decode_residual(H264Decoder *h, H264Slice *sl, int16_t *block, int n,
             PUT_COEF(*scantable, cavlc_dequant(level[i], (int)qmul[*scantable]));
         }
     }
-
-    if (tr)
-        TR_PRINT("");
 
     if (zeros_left < 0) {
         fprintf(stderr, "[h264dec] negative zeros left\n");
@@ -809,30 +752,17 @@ decode_intra_mb:
                 mb_type |= MB_TYPE_8x8DCT;
                 di = 4;
             }
-            if (i4_trace(sl)) {
-                int k;
-                fprintf(stderr, "I4C dump (rows of 8):\n");
-                for (k = 0; k < 64; k++)
-                    fprintf(stderr, "%d%c", sl->intra4x4_pred_mode_cache[k],
-                            (k % 8) == 7 ? '\n' : ' ');
-            }
             for (i = 0; i < 16; i += di) {
                 int mode = 2;
                 int left = sl->intra4x4_pred_mode_cache[h264_scan8[i] - 1];
                 int top = sl->intra4x4_pred_mode_cache[h264_scan8[i] - 8];
-                int rem = -1;
                 mode = H264_MIN(left, top);
                 if (mode < 0)
                     mode = 2;
                 if (!h264_br_get_bits1(br)) {
                     const int rem_mode = h264_br_get_bits(br, 3);
-                    rem = rem_mode;
                     mode = rem_mode + (rem_mode >= mode);
                 }
-                if (i4_trace(sl))
-                    fprintf(stderr, "I4 i%d s%d L%d T%d P%d rem%d m%d\n",
-                            i, h264_scan8[i], left, top,
-                            H264_MIN(left, top), rem, mode);
                 if (di == 4) {
                     sl->intra4x4_pred_mode_cache[h264_scan8[i]] = (int8_t)mode;
                     sl->intra4x4_pred_mode_cache[h264_scan8[i] + 1] = (int8_t)mode;

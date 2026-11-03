@@ -27,9 +27,19 @@
 typedef struct H264Worker {
     H264Decoder *master;
     H264Decoder clone;          /* per-worker state for the pixel work */
+    /* Snapshot of the last job's geometry for the loop-filter help. The worker
+     * may be handed the next job while it is still filtering this one, and
+     * bind_clone() rewrites `clone` under the owner's lock, so the filter pass
+     * must not read `clone` at all. */
+    H264Decoder filter_clone;
     int8_t clone_scratch[CLONE_SCRATCH_SIZE];
     H264Job job;
     volatile int quit;
+    /* Set under the decoder lock while this worker reads the shared MB
+     * geometry tables through filter_clone. h264_filter_clone_invalidate()
+     * freezes the helpers and waits for this flag before a dimension change
+     * frees those tables. */
+    int filter_busy;
     /* written only by the owner: it is what says whether there is a thread to
      * join, so the worker must not clear it as it exits - doing that made close
      * skip the join of exactly the threads that had already finished, leaving a
@@ -61,23 +71,6 @@ void h264_decoder_unlock(H264Decoder *h)
 {
     if (h->threaded)
         h264_mutex_unlock(h->mtx);
-}
-
-/* ------------------------------------------------------------------ */
-/* row progress of a picture                                           */
-/* ------------------------------------------------------------------ */
-/* H264_DEBUG_LAG=N stalls a progress report by roughly N microseconds between
- * the pixel writes and the publication. It changes no value that is published,
- * only when, so a wait bound that lets a consumer read rows the producer has
- * not finished becomes a plain wrong picture instead of a rare timing hit. */
-static void report_lag(void)
-{
-    int n = h264_dbg()->lag;
-    volatile int spin;
-
-    for (; n > 0; n--)
-        for (spin = 0; spin < 200; spin++)
-            ;
 }
 
 /* ------------------------------------------------------------------ */
@@ -309,8 +302,6 @@ void h264_progress_report(H264Decoder *h, H264Frame *f, int line, int dir)
 {
     if (!h->threaded)
         return;
-    if (h264_dbg()->lag)
-        report_lag();
     if (__atomic_load_n(&f->progress[dir], __ATOMIC_ACQUIRE) >= line)
         return;
     h264_mutex_lock(&f->sync->m);
@@ -355,7 +346,11 @@ static int all_idle(H264Decoder *h)
 }
 
 /* Reserve a free job slot; the caller holds the lock and fills the job in
- * before submitting it. */
+ * before submitting it. A worker that is off helping the filter pass is a
+ * candidate too: that pass runs on its own filter_clone, and bind_clone() only
+ * rewrites the decode clone, so the job can be bound while the filter works.
+ * When every slot is busy there is nothing to help with - a free slot is a
+ * committed picture, not a filter one - so sleep until a worker commits. */
 H264Job *h264_job_acquire(H264Decoder *h)
 {
     int i, slot = -1;
@@ -394,6 +389,47 @@ void h264_job_wait_all(H264Decoder *h)
         return;
     while (!all_idle(h))
         H264_WAIT(h);
+}
+
+/* The table pointers inside a worker's filter snapshot belong to the sequence
+ * it last decoded. A dimension or pixel-format change frees those tables, so
+ * freeze the filter helpers, wait for the passes already running, invalidate the
+ * snapshots and only then let the caller replace the tables.
+ *
+ * Freezing matters for more than the pointer lifetime: an idle worker that is
+ * left free to try an empty filter pass keeps waking the pool while the owner
+ * waits, and the drain then spends most of its time in wakeups instead of in
+ * the filter passes it is waiting for. */
+void h264_filter_clone_invalidate(H264Decoder *h)
+{
+    int i, busy;
+
+    if (!h->workers)
+        return;
+    h->filter_frozen = 1;
+    for (;;) {
+        busy = 0;
+        for (i = 0; i < h->nb_threads; i++)
+            if (h->workers[i].filter_busy) {
+                busy = 1;
+                break;
+            }
+        if (!busy)
+            break;
+        h->filter_waiters++;
+        H264_WAIT(h);
+        h->filter_waiters--;
+    }
+    for (i = 0; i < h->nb_threads; i++) {
+        H264Decoder *fc = &h->workers[i].filter_clone;
+
+        fc->mb_width = fc->mb_height = 0;
+        fc->mb_stride = fc->b_stride = 0;
+        fc->mb2b_xy = NULL;
+        fc->mb2br_xy = NULL;
+    }
+    h->filter_frozen = 0;
+    H264_WAKE(h);
 }
 
 /* ------------------------------------------------------------------ */
@@ -439,8 +475,29 @@ static void bind_clone(H264Worker *w, H264Job *job)
 #undef COPY
 
     cl->intra4x4_pred_mode = w->clone_scratch;
-    for (i = 0; i < job->nb_slices; i++)
-        h264_slice_bind_scratch(cl, job->slices[i]);
+    for (i = 0; i < job->nb_slices; i++) {
+        if (h264_slice_bind_scratch(cl, job->slices[i]) < 0) {
+            job->scratch_failed = 1;
+            return;
+        }
+    }
+}
+
+/* Save what the loop filter reads out of the job clone. Called under the
+ * decoder lock before the slot goes back to FREE, so the snapshot always
+ * describes the last picture this worker decoded. */
+static void snapshot_filter_clone(H264Worker *w)
+{
+    H264Decoder *fc = &w->filter_clone;
+    const H264Decoder *cl = &w->clone;
+
+    fc->mb_width = cl->mb_width;
+    fc->mb_height = cl->mb_height;
+    fc->mb_stride = cl->mb_stride;
+    fc->b_stride = cl->b_stride;
+    fc->mb2b_xy = cl->mb2b_xy;
+    fc->mb2br_xy = cl->mb2br_xy;
+    fc->param = cl->param;
 }
 
 static H264_THREAD_RET h264_worker_thread(void *arg)
@@ -451,19 +508,27 @@ static H264_THREAD_RET h264_worker_thread(void *arg)
 
     for (;;) {
         H264_LOCK(h);
-        while (w->job.state != H264_JOB_QUEUED && !w->quit) {
-            /* a free worker is the other kind of idle thread: filter rows of a
-             * picture somebody else is still decoding before sleeping. The
-             * predicate has to be read again afterwards - the condition above
-             * was tested before the lock went away, and a job or a quit that
-             * arrived while this thread was filtering would otherwise be missed
-             * by the wait below. */
-            H264_UNLOCK(h);
-            const int helped = h264_filter_help(&w->clone);
-            H264_LOCK(h);
-            if (helped)
-                continue;
-            if (w->job.state != H264_JOB_QUEUED && !w->quit)
+        for (;;) {
+            if (w->quit || w->job.state == H264_JOB_QUEUED)
+                break;
+            /* A free worker filters rows of a picture somebody else is still
+             * decoding before sleeping. It runs on filter_clone, so the owner
+             * can bind the next job to `clone` while this pass is running.
+             * filter_busy marks that the shared MB tables are in use, which is
+             * what a freeze waits for before replacing them. */
+            if (w->job.state == H264_JOB_FREE && !h->filter_frozen) {
+                int helped;
+                w->filter_busy = 1;
+                H264_UNLOCK(h);
+                helped = h264_filter_help(&w->filter_clone);
+                H264_LOCK(h);
+                w->filter_busy = 0;
+                if (h->filter_waiters)
+                    H264_WAKE(h);
+                if (helped)
+                    continue;
+            }
+            if (!w->quit && w->job.state != H264_JOB_QUEUED)
                 H264_WAIT(h);
         }
         if (w->quit) {
@@ -482,6 +547,9 @@ static H264_THREAD_RET h264_worker_thread(void *arg)
         while (h->commit_next != job.seq)
             H264_WAIT(h);
         h264_commit_job(h, &job);
+        /* the slot is not FREE yet, so bind_clone() cannot touch `clone`
+         * while the snapshot is taken */
+        snapshot_filter_clone(w);
         h->commit_next++;
         w->job.state = H264_JOB_FREE;
         H264_WAKE(h);
@@ -546,6 +614,12 @@ int h264_thread_init(H264Decoder *h, int threads)
         w->clone.intra4x4_pred_mode = NULL;
         w->clone.workers = NULL;
         w->clone.nb_threads = 0;
+        /* the filter helper needs the shared queue and the reporting switch;
+         * the geometry fields are filled by snapshot_filter_clone() */
+        w->filter_clone.fp = h->fp;
+        w->filter_clone.threaded = 1;
+        w->filter_clone.mtx = h->mtx;
+        w->filter_clone.cv = h->cv;
         w->job.state = H264_JOB_FREE;
         if (!worker_spawn(w)) {
             h->nb_threads = i;
@@ -572,6 +646,9 @@ void h264_thread_close(H264Decoder *h)
         H264Worker *w = &h->workers[i];
         if (w->spawned)
             worker_join(w);
+        /* each clone owns the MC scratch it grew while running jobs */
+        free(w->clone.scratch_edge);
+        free(w->clone.scratch_bipred);
     }
     free(h->workers);
     h->workers = NULL;

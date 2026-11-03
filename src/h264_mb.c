@@ -196,22 +196,6 @@ static void pred_motion(H264Decoder *h, H264Slice *sl, int n, int part_width,
             *my = mid_pred(A[1], B[1], C[1]);
         }
     }
-
-    if (H264_DBG_HIT(mv, sl)) {
-        fprintf(stderr, "MVP n%d i%d pw%d list%d ref%d A(%d,%d)ref%d B(%d,%d)ref%d C(%d,%d)ref%d -> (%d,%d)\n",
-                n, index8, part_width, list, ref, A[0], A[1], left_ref, B[0], B[1], top_ref,
-                C[0], C[1], diagonal_ref, *mx, *my);
-        if (n == 0 && list == 0) {
-            int dk;
-            for (dk = 0; dk < 48; dk += 8) {
-                int dj;
-                for (dj = 0; dj < 8; dj++)
-                    fprintf(stderr, "CACHE %2d (%3d,%3d) r%2d\n", dk + dj,
-                            sl->mv_cache[0][dk + dj][0], sl->mv_cache[0][dk + dj][1],
-                            sl->ref_cache[0][dk + dj]);
-            }
-        }
-    }
 }
 
 static void pred_16x8_motion(H264Decoder *h, H264Slice *sl, int n, int list, int ref,
@@ -1010,31 +994,7 @@ static void mc_dir_part(H264Decoder *h, H264Slice *sl, H264Ref *pic, int n,
         emu = 1;
     }
 
-    if (H264_DBG_HIT(mc, sl)) {
-        int mi2;
-        fprintf(stderr, "MC fn%d %d,%d l%d n%d sq%d h%d mx %d my %d full(%d,%d) emu%d rp%d cur%d dp%d in",
-                f->frame_num, sl->mb_x, sl->mb_y, list, n, w == hgt,
-                hgt, mx, my, full_mx, full_my, emu, pic->parent->reference,
-                (int)(pic->parent->data[0] - f->data[0]),
-                (int)(src_y - pic->parent->data[0]));
-        for (mi2 = 0; mi2 < hgt; mi2++)
-            fprintf(stderr, " %d%d%d%d", src_y[mi2 * sl->mb_linesize - 2],
-                    src_y[mi2 * sl->mb_linesize - 1], src_y[mi2 * sl->mb_linesize],
-                    src_y[mi2 * sl->mb_linesize + 1]);
-        fprintf(stderr, "\n");
-    }
-
     h264_qpel_mc(dest_y, src_y, sl->mb_linesize, w, hgt, mx & 3, my & 3, avg);
-
-    if (H264_DBG_HIT(mc, sl)) {
-        int mi2;
-        fprintf(stderr, "MC fn%d %d,%d out", f->frame_num, sl->mb_x, sl->mb_y);
-        for (mi2 = 0; mi2 < hgt; mi2++)
-            fprintf(stderr, " %d%d%d%d", dest_y[mi2 * sl->mb_linesize - 2],
-                    dest_y[mi2 * sl->mb_linesize - 1], dest_y[mi2 * sl->mb_linesize],
-                    dest_y[mi2 * sl->mb_linesize + 1]);
-        fprintf(stderr, "\n");
-    }
 
     if (MB_FIELD(sl)) {
         /* chroma of a field macroblock samples the same-parity chroma rows of
@@ -1896,44 +1856,6 @@ void h264_hl_decode_mb(H264Decoder *h, H264Slice *sl)
         h264_hl_decode_mb_16(h, sl);
         return;
     }
-    static H264_THREAD_LOCAL int dbg_count = 0;
-    if (h264_dbg()->mb && dbg_count < 200000) {
-        H264Frame *fd = h->cur_pic;
-        fprintf(stderr, "MB %2d %2d fn %d type %08x i16 %d ch %d cbp %02x qp %d bit %d dc %d nnz0 %d mb0 %d\n",
-                sl->mb_x, sl->mb_y, fd->frame_num, fd->mb_type[sl->mb_xy], sl->intra16x16_pred_mode,
-                sl->chroma_pred_mode, sl->cbp, sl->qscale, sl->gb.pos, sl->mb[0],
-                sl->non_zero_count_cache[h264_scan8[0]], sl->mb[1]);
-        {
-            int mv8[8], ref8[4], mi;
-            for (mi = 0; mi < 4; mi++) {
-                const int idx = h264_scan8[mi * 4];
-                mv8[2*mi] = (int)sl->mv_cache[0][idx][0];
-                mv8[2*mi + 1] = (int)sl->mv_cache[0][idx][1];
-                ref8[mi] = sl->ref_cache[0][idx];
-            }
-            fprintf(stderr, "  mv0: (%d,%d) r%d (%d,%d) r%d (%d,%d) r%d (%d,%d) r%d\n",
-                    mv8[0], mv8[1], ref8[0], mv8[2], mv8[3], ref8[1],
-                    mv8[4], mv8[5], ref8[2], mv8[6], mv8[7], ref8[3]);
-        }
-        if (h264_dbg()->coef) {
-            static int coef_line = 0;
-            int ci;
-            fprintf(stderr, "COEF %d %2d %2d", ++coef_line, sl->mb_x, sl->mb_y);
-            for (ci = 0; ci < 256; ci++)
-                fprintf(stderr, " %d", sl->mb[ci]);
-            fprintf(stderr, "\n");
-        }
-        if (IS_INTRA4x4(fd->mb_type[sl->mb_xy])) {
-            int mi;
-            fprintf(stderr, "  modes:");
-            for (mi = 0; mi < 16; mi++)
-                fprintf(stderr, " %d", sl->intra4x4_pred_mode_cache[h264_scan8[mi]]);
-            fprintf(stderr, "  t %x l %x tl %x tr %x\n",
-                    sl->top_samples_available, sl->left_samples_available,
-                    sl->topleft_samples_available, sl->topright_samples_available);
-        }
-        dbg_count++;
-    }
     H264Frame *f = h->cur_pic;
     const int mb_x = sl->mb_x;
     const int mb_y = sl->mb_y;
@@ -2006,17 +1928,6 @@ void h264_hl_decode_mb(H264Decoder *h, H264Slice *sl)
                                   transform_bypass);
     } else {
         hl_motion(h, sl, dest_y, dest_cb, dest_cr);
-        if (H264_DBG_HIT(pred, sl)) {
-            int pi_, pj_;
-            fprintf(stderr, "PBD fn %d st %d qp %d cbp %02x mbt %08x\n",
-                    f->frame_num, sl->slice_type, sl->qscale, sl->cbp, mb_type);
-            for (pi_ = 0; pi_ < 16; pi_++) {
-                fprintf(stderr, "PRED ");
-                for (pj_ = 0; pj_ < 16; pj_++)
-                    fprintf(stderr, " %d", dest_y[pi_ * linesize + pj_]);
-                fprintf(stderr, "\n");
-            }
-        }
     }
 
     hl_decode_mb_idct_luma(h, sl, mb_type, block_offset, linesize, dest_y,
@@ -2051,26 +1962,6 @@ void h264_hl_decode_mb(H264Decoder *h, H264Slice *sl)
             h264_idct_add8(dest, block_offset, sl->mb, uvlinesize, sl->non_zero_count_cache);
         }
     }
-
-    if (h264_dbg()->dm) {
-        static int dm_seq;
-        int li_, mi_;
-        if (++dm_seq > 400)
-            return;
-        fprintf(stderr, "DMB %d %d fn %d st %d nr %d %d %d t=%08x s=%04x,%04x,%04x,%04x",
-                dm_seq, f->poc, f->frame_num, sl->slice_type, sl->nal_ref_idc, mb_x, mb_y, mb_type,
-                sl->sub_mb_type[0], sl->sub_mb_type[1],
-                sl->sub_mb_type[2], sl->sub_mb_type[3]);
-        for (li_ = 0; li_ < 2; li_++) {
-            fprintf(stderr, " L%d:", li_);
-            for (mi_ = 0; mi_ < 4; mi_++) {
-                const int idx = h264_scan8[mi_ * 4];
-                fprintf(stderr, " %d/%d,%d", sl->ref_cache[li_][idx],
-                        (int)sl->mv_cache[li_][idx][0], (int)sl->mv_cache[li_][idx][1]);
-            }
-        }
-        fprintf(stderr, "\n");
-    }
 }
 
 static void h264_hl_decode_mb_16(H264Decoder *h, H264Slice *sl)
@@ -2092,22 +1983,6 @@ static void h264_hl_decode_mb_16(H264Decoder *h, H264Slice *sl)
     f->mb_deblock_idc[mb_xy] = (int8_t)sl->deblocking_filter;
     f->mb_alpha[mb_xy] = (int8_t)sl->slice_alpha_c0_offset;
     f->mb_beta[mb_xy] = (int8_t)sl->slice_beta_offset;
-
-    if (h264_dbg()->mb) {
-        int mi_;
-        fprintf(stderr, "MB %2d %2d fn %d type %08x i16 %d ch %d cbp %02x qp %d bit %d dc %d nnz0 %d mb0 %d\n",
-                mb_x, mb_y, f->frame_num, mb_type, sl->intra16x16_pred_mode,
-                sl->chroma_pred_mode, sl->cbp, sl->qscale, sl->gb.pos,
-                sl->mb[0], sl->non_zero_count_cache[h264_scan8[0]], sl->mb[1]);
-        for (mi_ = 0; mi_ < 4; mi_++) {
-            const int idx = h264_scan8[mi_ * 4];
-            fprintf(stderr, "  mv %d: l0 (%d,%d) r%d  l1 (%d,%d) r%d\n", mi_,
-                    (int)sl->mv_cache[0][idx][0], (int)sl->mv_cache[0][idx][1],
-                    sl->ref_cache[0][idx],
-                    (int)sl->mv_cache[1][idx][0], (int)sl->mv_cache[1][idx][1],
-                    sl->ref_cache[1][idx]);
-        }
-    }
 
     if (MB_FIELD(sl)) {
         linesize = sl->mb_linesize = f->linesize[0] * 2;
